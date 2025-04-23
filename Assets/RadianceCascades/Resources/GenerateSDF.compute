@@ -1,0 +1,103 @@
+#include "UnityCG.cginc"
+#pragma enable_d3d11_debug_symbols
+
+#pragma kernel _PreprocessKernel
+#pragma kernel _FloodKernel
+#pragma kernel _DistanceKernel
+
+#define UINT16_MAX 65535
+
+// EnvTexture R16G16B16A16_SFloat 
+//    RGB for light color, A means obstacle or light source when A > 0
+// e.g light source: (0.82, 0.12, 0.12, 1.0)
+//             wall: (0.0, 0.0, 0.0, 1.0)
+//            empty: (0.0, 0.0, 0.0, 0.0)
+Texture2D<float4> _EnvTexture;
+
+// FlooadTexture R16G16_SInt
+//    coordinate of nearest obstacle or light source
+RWTexture2D<int2> _FloodTexture;
+
+// SDFTexture R16_UNorm
+//    normalized distance to nearest obstacle or light source
+//    SDFTexture(coord) =  texel distance / max(tex_width, tex_height)
+RWTexture2D<float> _SDFTexture;
+
+
+CBUFFER_START(Setting)
+int _Step;
+int2 _Resolution;
+CBUFFER_END
+
+// neighbours we want to search
+#define THREAD_GROUP_SIZE 8
+#define NEIGHBOUR_COUNT 9 
+static const int2 offsets[NEIGHBOUR_COUNT] =
+{
+    int2(-1, -1), int2(0, -1), int2(1, -1),
+	int2(-1, 0), int2(0, 0), int2(1, 0),
+	int2(-1, 1), int2(0, 1), int2(1, 1),
+};
+
+
+// transform EnvTexture to FloodTexture, we shift the coordinate by int2(1, 1).
+// we want to use int2(0, 0) to represent no nearest coordinate, so it will return int2(0, 0) by default when sampling at outside of the texture,
+// all empty pixels in EnvTexture will be initialized as int2(0, 0).
+// all light source or obstacle pixels in EnvTexture will be initialized as their own coordinate + int2(1, 1).
+[numthreads(16, 16, 1)]
+void _PreprocessKernel(int3 dtid : SV_DispatchThreadID)
+{
+    _FloodTexture[dtid.xy] = _EnvTexture[dtid.xy].w ? dtid.xy + int2(1, 1) : int2(0, 0);
+}
+
+// store the (nearest_coord.xy, nearest_distance)
+groupshared int3 neighbour[THREAD_GROUP_SIZE * THREAD_GROUP_SIZE * NEIGHBOUR_COUNT];
+
+// calculate nearest obstacle or light source coordinate by JFA
+// explanation is here: https://blog.demofox.org/2016/02/29/fast-voronoi-diagrams-and-distance-dield-textures-on-the-gpu-with-the-jump-flooding-algorithm/
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, NEIGHBOUR_COUNT)]
+void _FloodKernel(int3 dtid : SV_DispatchThreadID, int3 gtid : SV_GroupThreadID)
+{
+    int shared_base = (gtid.y * THREAD_GROUP_SIZE + gtid.x) * NEIGHBOUR_COUNT; // base address of groupshared memory
+    
+    int2 sample_coord = dtid.xy + offsets[gtid.z] * _Step;
+    int2 nearest_coord = _FloodTexture[sample_coord];
+    int2 shifted_coord = dtid.xy + int2(1, 1);
+    
+    int2 diff = nearest_coord - shifted_coord;
+
+    int dist = any(nearest_coord.xy) ? dot(diff, diff) : 9999999;
+    
+    neighbour[shared_base + gtid.z] = int3(nearest_coord, dist);
+
+    // wait until all threads have written to groupshared memory
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gtid.z == 0)
+    {
+        int min_dist = 9999999;
+        int2 min_coord = int2(0, 0);
+        for (int i = 0; i < NEIGHBOUR_COUNT; i++)
+        {
+            int neighbour_index = shared_base + i;
+            int3 info = neighbour[neighbour_index];
+            if (min_dist > info.z)
+            {
+                min_dist = info.z; // info.z stores the nearest distance
+                min_coord = info.xy; // info.xy stores the nearest coordinate
+            }
+        }
+
+        _FloodTexture[dtid.xy] = min_coord;
+    }
+}
+
+
+// transform the nearest coordinate to distance
+[numthreads(16, 16, 1)]
+void _DistanceKernel(int3 dtid : SV_DispatchThreadID)
+{
+    int2 shiffted_coord = _FloodTexture[dtid.xy];
+
+    _SDFTexture[dtid.xy] = any(shiffted_coord) ? length(shiffted_coord - int2(1, 1) - dtid.xy) / max(_Resolution.x, _Resolution.y) : UINT16_MAX;
+}

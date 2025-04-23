@@ -1,0 +1,112 @@
+#include "UnityCG.cginc"
+
+#pragma kernel _ComputeCascadesKernel
+#pragma enable_d3d11_debug_symbols
+
+#define PI 3.141592653589793
+#define INV_PI 0.3183098861837907
+#define SDFTextureRatio 4
+#define NumSDFCascades 2
+
+
+// R16G16B16A16_SFloat 
+//    RGB for light color, A means obstacle or light source when A > 0, A = 0 means empty
+// e.g light source: (0.82, 0.12, 0.12, 1.0)
+//             wall: (0.0, 0.0, 0.0, 1.0)
+//            empty: (0.0, 0.0, 0.0, 0.0)
+Texture2D<float4> _EnvTexture;
+
+// R16_UNorm
+//    normalized distance to nearest obstacle or light source
+//    SDFTexture(coord) =  texel distance / max(texture_width, texture_height)
+Texture2D<float> _SDFTexture;
+
+// CascadesTexture R16G16B16A16_SFloat
+//      radiance data of a single cascade
+RWTexture2D<float4> _CascadeTexture;
+
+
+
+cbuffer ComputeCascadeSetting
+{
+    // the texutre size of _SDFTexture and _CascadeTexture, the width and height are the same
+    float2 _SDFTextureSize; // (size, 1 / size)
+
+    int2 _Resolution; // _CascadeTexture resolution
+    int2 _CascadeRange; // range of the radiance interval in this cascade
+    int _ProbeSize; // texel size per probe
+    float _AngleStep; // the angle difference between each ray's direction
+};
+
+// screen position to level 0 SDF texel coordinate
+float2 screen_space_to_sdf_texel_space(float2 pos_screen)
+{
+    float2 texel_pos = pos_screen + int2(_SDFTextureSize.x - _ScreenParams.x, _SDFTextureSize.x - _ScreenParams.y) * 0.5;
+    return texel_pos;
+}
+
+float sample_sdf(float2 pos_sdf)
+{
+    return _SDFTexture[pos_sdf] * _SDFTextureSize.x; // normalized distance to texel distance
+}
+
+float3 sample_scene(float2 pos_sdf)
+{
+    return _EnvTexture[pos_sdf].rgb;
+}
+
+float4 sample_radiance(float2 origin, float2 direction, int2 range)
+{
+    float t = range.x;
+ 
+    // ray marching
+    for (int i = 0; i < 16; i++)
+    {
+        float2 pos = origin + direction * t;
+        float2 pos_sdf = screen_space_to_sdf_texel_space(pos);
+        
+        float dist = sample_sdf(pos_sdf);
+        if (dist < 0.01)
+        {
+            return float4(sample_scene(pos_sdf), 0.0);
+        }
+
+        t += dist;
+        if (t > range.y)
+        {
+            // exceed the range of this radiance interval
+            return float4(0, 0, 0, 1.0);
+        }
+    }
+    
+    return float4(0, 0, 0, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void _ComputeCascadesKernel(uint3 dtid : SV_DispatchThreadID)
+{
+    //position of this pixel inside the cascade probe
+    float2 ray_coord = fmod(dtid.xy, _ProbeSize);
+    
+    //We calculate the angle of this pixel
+    int ray_index = (ray_coord.x + ray_coord.y * _ProbeSize);
+    //we add a small offset to the angle so that we don't keep casting a ray in the same direction in all the cascades
+    float angle = (ray_index + 0.5) * _AngleStep;
+
+    //-------------------------------------------------------------------
+    //angles in cascade0 without offset : 0, 90, 180, 270
+    //angles in cascade1 without offset : 0, 22.5, 45, 67.5, 90, ... (angles repeat)
+    //-------------------------------------------------------------------
+    //angles in cascade0 with offset : 45, 135, 225, 315
+    //angles in cascade1 with offset : 11.25, 33.75, 56.25, 78.75 ... (angles doesn't repeat)
+    //-------------------------------------------------------------------
+    //(the anlges in the example above are in Degrees, in the actual code we calculate them in Radian)
+
+    float2 ray_origin = floor(dtid.xy / (float) _ProbeSize) * _ProbeSize + _ProbeSize * 0.5f; //the center of the probe is the origin of the ray
+    float2 ray_direction = float2(cos(angle), sin(angle));
+
+    //finally the ray marching 
+    float4 radiance = sample_radiance(ray_origin, ray_direction, _CascadeRange);
+
+    _CascadeTexture[dtid.xy] = radiance;
+}

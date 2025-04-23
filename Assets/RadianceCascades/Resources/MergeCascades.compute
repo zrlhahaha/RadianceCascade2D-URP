@@ -1,0 +1,157 @@
+#pragma kernel _MergeCascadesKernel
+#pragma kernel _GenerateIrradiance
+#pragma enable_d3d11_debug_symbols
+
+#define PI 3.141592653589793
+#define INV_PI 0.3183098861837907
+
+// level 0 cascade probe size, corresponds to 2x2 pixels and 4 directions
+static const int CASCADE0_PROBE_SIZE = 2;
+
+// CascadesTexture R16G16B16A16_SFloat
+//      radiance data of the lower cascade, has more probes but less rays per probe
+RWTexture2D<float4> _LowerCascade;
+
+// CascadesTexture R16G16B16A16_SFloat
+//      radiance data of the higher cascade, has less probes but more rays per probe
+RWTexture2D<float4> _UpperCascade;
+
+// CascadesTexture R16G16B16A16_SFloat
+//      irradiance data of the scene, once we merged all the cascades, we add up the radiance and store the result here
+RWTexture2D<float4> _IrradianceTexture;
+
+cbuffer MergeCascadeSetting
+{
+    int _LowerCascadeProbeSize; // texel size per probe
+    float2 _LowerAngleStep; // angle difference between rays, _LownerAngleStep = (angle_step, 1 / angle_step)
+
+    int _UpperCascadeProbeSize; //texel size per probe
+    float2 _UpperAngleStep; // angle difference between rays, _UpperAngleStep = (angle_step, 1 / angle_step)
+};
+
+// calculates the texel coordinate of a ray
+int2 index_to_coord(uint index, uint probe_size)
+{
+    index = index % (probe_size * probe_size); //in case the index is lower than 0 or higher than the number of angles
+    int x = index % probe_size;
+    int y = index / probe_size;
+    
+    return int2(x, y);
+}
+
+int coord_to_index(uint2 coord, uint probe_size)
+{
+    uint2 local_coord = coord % probe_size;
+    return local_coord.x + local_coord.y * probe_size;
+}
+
+// get the average radiance at the @angle in the upper cascade
+float4 sample_upper_probe(int2 probe_origin, float angle)
+{
+    angle = angle - _UpperAngleStep.x * 0.5;
+    
+    // angle = index * angle_step
+    // index = angle / angle_step
+    int ray_index = angle * _UpperAngleStep.y;
+
+    // sample 4 nearby rays and average them
+    int2 ray1_coord = probe_origin + index_to_coord(ray_index - 1, _UpperCascadeProbeSize);
+    int2 ray2_coord = probe_origin + index_to_coord(ray_index, _UpperCascadeProbeSize);
+    int2 ray3_coord = probe_origin + index_to_coord(ray_index + 1, _UpperCascadeProbeSize);
+    int2 ray4_coord = probe_origin + index_to_coord(ray_index + 2, _UpperCascadeProbeSize);
+
+    float4 rad1 = _UpperCascade[ray1_coord];
+    float4 rad2 = _UpperCascade[ray2_coord];
+    float4 rad3 = _UpperCascade[ray3_coord];
+    float4 rad4 = _UpperCascade[ray4_coord];
+    
+    return (rad1 + rad2 + rad3 + rad4) * 0.25;
+}
+
+float4 sample_upper_cascade(uint2 texel_coord, float angle)
+{
+    int2 lower_probe_index = texel_coord / (uint)_LowerCascadeProbeSize;
+    int2 lower_probe_center = (lower_probe_index + 0.5 ) * _LowerCascadeProbeSize;
+    
+    //there are 4 upper probes surrounding the lower probe: bottom-left, bottom-right, top-left, top-right
+    //|   |   |   |   |
+    //|   |   |   |   |
+    //----2-------2-----
+    //|   | 1 | 1 |   |
+    //|   |   |   |   |
+    //------------------
+    //|   |   |   |   |
+    //|   | 1 | 1 |   |
+    //----2-------2-----
+    //|   |   |   |   |
+    //|   |   |   |   |
+    // fig.1 4 upper probes(marked by 2) surround the lower probe(marked by 1)
+    
+    // calculate the position of bottom-left upper probe
+    int2 upper_probe_index = floor((lower_probe_index - 1) * 0.5);
+    int2 upper_probe_origin = upper_probe_index * _UpperCascadeProbeSize;
+    int2 upper_probe_center = upper_probe_origin + 0.5 * _UpperCascadeProbeSize;
+    
+    // sample radiance at the angle in the 4 nearby upper probe
+    float4 rad1 = sample_upper_probe(upper_probe_origin, angle);
+    float4 rad2 = sample_upper_probe(upper_probe_origin + int2(_UpperCascadeProbeSize, 0), angle);
+    float4 rad3 = sample_upper_probe(upper_probe_origin + int2(0, _UpperCascadeProbeSize), angle);
+    float4 rad4 = sample_upper_probe(upper_probe_origin + int2(_UpperCascadeProbeSize, _UpperCascadeProbeSize), angle);
+
+    // bilinearly interpolate between these 4 upper probe
+    // the weight have exactly 4 possible values : (0.25, 0.25), (0.25, 0.75), (0.75, 0.25), (0.75, 0.75)
+    const float2 weights[4] = { float2(0.25, 0.25), float2(0.75, 0.25), float2(0.25, 0.75), float2(0.75, 0.75)};
+    
+    // upper/lower_probe_index: the index of the upper/lower probe which this pixel belongs to
+    // upper_probe_index (upi) and lower_probe_index (lpi) have the following relationship:
+    // upi = floor((lpi - 1) / 2)
+    // lpi = upi * 2 + 1
+    int2 index_offset = lower_probe_index - (upper_probe_index * 2 + 1); // could be (0, 0), (0, 1), (1, 0), (1, 1)
+    
+    // get the weight of this lower probe
+    int weight_index = index_offset.x + index_offset.y * 2;
+    float2 weight = weights[weight_index];
+
+    // do the bilinear interpolation
+    float4 x1 = lerp(rad1, rad2, weight.x);
+    float4 x2 = lerp(rad3, rad4, weight.x);
+    float4 rad = lerp(x1, x2, weight.y);
+    
+    return rad;
+}
+
+
+[numthreads(8,8,1)]
+void _MergeCascadesKernel (uint3 dtid : SV_DispatchThreadID)
+{
+    int lower_index = coord_to_index(dtid.xy, _LowerCascadeProbeSize);
+    float angle = lower_index * _LowerAngleStep.x;
+    
+    // the actual angle is shifted so the rays in each cascades don't overlap
+    angle += _LowerAngleStep.x * 0.5;
+    
+    float4 rad1 = _LowerCascade[dtid.xy];
+    float4 rad2 = sample_upper_cascade(dtid.xy, angle);
+    
+    rad1.rgb = rad1.rgb + rad2.rgb * rad1.a;
+    _LowerCascade[dtid.xy] = rad1;
+}
+
+// calculate the irradiance of the scene by summing up the radiance of all cascades
+// the actual irradiance texture has the half size of the cascades texture, cause each probe has 2x2 pixels in the level 0 cascade
+[numthreads(8, 8, 1)]
+void _GenerateIrradiance(uint3 dtid : SV_DispatchThreadID)
+{
+    int2 probe_index = dtid.xy;
+    int2 probe_origin = probe_index * CASCADE0_PROBE_SIZE;
+    
+    float4 irradiance = float4(0, 0, 0, 0);
+    
+    irradiance += _LowerCascade[probe_origin + int2(0, 0)];
+    irradiance += _LowerCascade[probe_origin + int2(1, 0)];
+    irradiance += _LowerCascade[probe_origin + int2(0, 1)];
+    irradiance += _LowerCascade[probe_origin + int2(1, 1)];
+    irradiance *= 0.25;
+
+    _IrradianceTexture[dtid.xy] = irradiance;
+}
